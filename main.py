@@ -1,17 +1,20 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Optional
 from schemas import Product, ScanResponse, ScanQuery
 from database import create_document, get_documents
 import random
 import datetime
+import os
+import httpx
 
-app = FastAPI(title="EcoShopper API", version="1.0.0")
+app = FastAPI(title="EcoShopper API", version="1.1.0")
 
-# Allow all origins for sandbox; in production, restrict this
+# Use regex to allow credentials with any origin in sandbox. In production, restrict this.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,6 +50,60 @@ def add_months(d: datetime.datetime, months: int) -> datetime.datetime:
 @app.get("/test")
 async def test():
     return {"status": "ok"}
+
+
+# Google ID token verification endpoint
+@app.post("/auth/google/verify")
+async def google_verify(payload: dict, response: Response):
+    id_token: Optional[str] = payload.get("idToken") if isinstance(payload, dict) else None
+    if not id_token or not isinstance(id_token, str):
+        raise HTTPException(status_code=400, detail="Missing idToken")
+
+    # Verify with Google's tokeninfo endpoint (sufficient for demo).
+    tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(tokeninfo_url, params={"id_token": id_token})
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+        info = r.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Google verification timeout")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Verification failed")
+
+    # Optional audience check if configured
+    backend_client_id = os.getenv("GOOGLE_CLIENT_ID") or os.getenv("VITE_GOOGLE_CLIENT_ID")
+    aud = info.get("aud")
+    if backend_client_id and aud and aud != backend_client_id:
+        raise HTTPException(status_code=401, detail="Token audience mismatch")
+
+    # Basic payload fields
+    email = info.get("email")
+    name = info.get("name") or info.get("given_name") or "User"
+    picture = info.get("picture")
+    sub = info.get("sub")
+
+    # For demo, set an HTTP-only session cookie with the Google sub as value
+    # In production, issue a server-generated session id mapped to a DB record.
+    cookie_name = "ecoshopper_session"
+    cookie_value = sub or "session"
+    response.set_cookie(
+        key=cookie_name,
+        value=cookie_value,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=60 * 60 * 8,  # 8 hours
+    )
+
+    return {"ok": True, "profile": {"email": email, "name": name, "picture": picture, "sub": sub}}
+
+
+@app.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("ecoshopper_session")
+    return {"ok": True}
 
 
 @app.post("/scan", response_model=ScanResponse)
